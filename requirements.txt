@@ -1,0 +1,4 @@
+numpy>=2.0,<3
+SoundCard>=0.4.5,<0.5
+websockets>=16,<17
+openai>=2.29,<3

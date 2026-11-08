@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.test-data/
+.test-transcripts/
+.vendor/
+speaker-model.onnx
+.env
+.env.*
+*.key
+*.pem

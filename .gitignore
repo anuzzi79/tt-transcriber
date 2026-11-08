@@ -8,3 +8,4 @@ speaker-model.onnx
 .env.*
 *.key
 *.pem
+.playwright-mcp/

@@ -13,7 +13,7 @@ python main.py
 
 In **Tools → AssemblyAI API Key**, paste the key and save it. It is protected with Windows DPAPI under the current user account. Press **Ctrl+Alt+Q** to start and stop. The transcript is written progressively to `Documents\3transcript\TT_<date>_<time>.txt`. The microphone is labeled **Antonio**. The window stays open when the shortcut stops a session.
 
-While transcription is running, the Windows taskbar icon pulses red with a 0.33-second cycle. It returns to its normal blue icon as soon as recording stops.
+While transcription is running, a red indicator behind the Windows taskbar button pulses with a 0.33-second cycle. The indicator disappears when recording stops; the window title icon is not animated.
 
 To summarize a completed part of the current meeting, enter an OpenAI key under **Tools → OpenAI API Key (Summary & Chat)**. Drag along the vertical green timeline between the transcript and the summary panel. The selected section turns yellow; releasing the mouse starts an Italian summary in the right panel. A new drag replaces the selection and summary. The complete transcript at the time of release is sent to OpenAI as context, while the summary is instructed to cover only the selected lines. Each release starts a separate API request. Summaries are displayed in the app and are not added to the TXT file. The OpenAI key is stored separately with Windows DPAPI.
 

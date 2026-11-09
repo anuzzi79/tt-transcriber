@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timedelta
 import queue
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 import webbrowser
@@ -12,11 +13,15 @@ from tt.engine import MeetingEngine
 from tt.hotkey import Hotkey
 from tt.storage import (load_api_key, load_openai_api_key, load_settings, save_api_key,
                         save_openai_api_key, save_settings, transcript_dir, Transcript)
-from tt.summary import answer_question, line_at, summarize
+from tt.summary import (DEFAULT_OPENAI_MODEL, OPENAI_MODELS, analyze_topics,
+                        answer_question, line_at, merge_topics, summarize, topic_range)
 from tt.voices import VoiceProfiles
 
 
 class TTApp:
+    BAR_LEFT = 23
+    BAR_RIGHT_MARGIN = 4
+
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("TT Transcriber")
@@ -34,6 +39,17 @@ class TTApp:
         self.last_live = ""
         self.timeline_selection: tuple[int, int] | None = None
         self.timeline_anchor: int | None = None
+        self.topic_markers: list[dict] = []
+        self.topic_hitboxes: list[tuple[float, dict]] = []
+        self.topic_tooltip: tk.Toplevel | None = None
+        self.topic_hover_start: int | None = None
+        self.topic_request_id = 0
+        self.topic_pending = False
+        self.topic_force_after_pending = False
+        self.topic_model_unavailable = False
+        self.topic_last_count = 0
+        self.topic_last_at = 0.0
+        self.topic_last_global_at = 0.0
         self.summary_request_id = 0
         self.chat_request_id = 0
         self.current_summary = ""
@@ -44,6 +60,11 @@ class TTApp:
         self._build()
         self._install_hotkey()
         self.root.after(80, self._drain)
+        self.root.after(20_000, self._topic_tick)
+
+    def _openai_model(self) -> str:
+        model = self.settings.get("openai_model", DEFAULT_OPENAI_MODEL)
+        return model if model in OPENAI_MODELS else DEFAULT_OPENAI_MODEL
 
     def _build(self):
         menu = tk.Menu(self.root)
@@ -95,12 +116,14 @@ class TTApp:
         self.text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        self.timeline = tk.Canvas(workspace, width=38, highlightthickness=0, bg="#e8eee9", cursor="crosshair")
+        self.timeline = tk.Canvas(workspace, width=56, highlightthickness=0, bg="#e8eee9", cursor="crosshair")
         self.timeline.pack(side="left", fill="y", padx=(10, 8))
         self.timeline.bind("<Configure>", lambda _event: self._draw_timeline())
         self.timeline.bind("<ButtonPress-1>", self._timeline_press)
         self.timeline.bind("<B1-Motion>", self._timeline_drag)
         self.timeline.bind("<ButtonRelease-1>", self._timeline_release)
+        self.timeline.bind("<Motion>", self._timeline_motion)
+        self.timeline.bind("<Leave>", lambda _event: self._hide_topic_tooltip())
 
         summary_panel = ttk.Frame(workspace, width=360)
         summary_panel.pack(side="right", fill="y")
@@ -225,10 +248,11 @@ class TTApp:
         current_summary = self.current_summary
         current_dialogue = deepcopy(self.current_dialogue)
         previous_dialogues = deepcopy(self.previous_dialogues)
+        model = self._openai_model()
         def worker():
             try:
                 answer = answer_question(key, lines, question, current_summary,
-                                         current_dialogue, previous_dialogues)
+                                         current_dialogue, previous_dialogues, model=model)
                 self.events.put(("chat_ok", (request_id, question, answer)))
             except Exception as exc:
                 self.events.put(("chat_error", (request_id, question, str(exc))))
@@ -261,7 +285,9 @@ class TTApp:
         width = max(1, self.timeline.winfo_width())
         height = max(1, self.timeline.winfo_height())
         self.timeline.delete("all")
-        self.timeline.create_rectangle(4, 0, width - 4, height, fill="#2ca75b", outline="")
+        self.topic_hitboxes = []
+        self.timeline.create_rectangle(self.BAR_LEFT, 0, width - self.BAR_RIGHT_MARGIN, height,
+                                       fill="#2ca75b", outline="")
         items = self._speech_items()
         count = len(items)
         if self.timeline_selection and count:
@@ -270,7 +296,19 @@ class TTApp:
             total = sum(weights)
             top = height * sum(weights[:first]) / total
             bottom = max(top + 2, height * sum(weights[:last + 1]) / total)
-            self.timeline.create_rectangle(4, top, width - 4, bottom, fill="#ffd443", outline="#d6a100")
+            self.timeline.create_rectangle(self.BAR_LEFT, top, width - self.BAR_RIGHT_MARGIN,
+                                           bottom, fill="#ffd443", outline="#d6a100")
+        if count:
+            weights = self._timeline_weights(items)
+            total = sum(weights)
+            for marker in self.topic_markers:
+                start = marker["start"]
+                if start >= count:
+                    continue
+                y = min(height - 8, max(8, height * sum(weights[:start]) / total))
+                self.topic_hitboxes.append((y, marker))
+                self.timeline.create_polygon(3, y - 7, self.BAR_LEFT, y, 3, y + 7,
+                                             fill="#195c9e", outline="#123f6a")
 
     def _timeline_position(self, y: int) -> int | None:
         items = self._speech_items()
@@ -289,6 +327,9 @@ class TTApp:
         self.summary_range.config(text=f"{start}–{end} · Lines {first + 1}–{last + 1} of {len(items)}{suffix}")
 
     def _timeline_press(self, event):
+        if event.x < self.BAR_LEFT:
+            self._topic_click(event)
+            return
         index = self._timeline_position(event.y)
         if index is None:
             self.summary_range.config(text="Start transcribing to select a section.")
@@ -297,6 +338,7 @@ class TTApp:
         self.timeline_selection = (index, index)
         self.summary_request_id += 1
         self._set_summary("Release the mouse to summarize the yellow section.")
+        self._hide_topic_tooltip()
         self._draw_timeline()
         self._show_selection_range(dragging=True)
 
@@ -319,6 +361,125 @@ class TTApp:
         self._begin_new_chat_cycle()
         self._request_summary()
 
+    def _topic_at(self, y: int) -> dict | None:
+        closest = None
+        distance = 10
+        for marker_y, marker in self.topic_hitboxes:
+            gap = abs(marker_y - y)
+            if gap < distance:
+                closest, distance = marker, gap
+        return closest
+
+    def _timeline_motion(self, event):
+        marker = self._topic_at(event.y) if event.x < self.BAR_LEFT else None
+        if marker is None:
+            self._hide_topic_tooltip()
+            self.timeline.config(cursor="crosshair")
+            return
+        self.timeline.config(cursor="hand2")
+        if self.topic_hover_start == marker["start"]:
+            return
+        self._hide_topic_tooltip()
+        items = self._speech_items()
+        when = datetime.fromisoformat(items[marker["start"]]["when"]).strftime("%H:%M:%S")
+        tip = tk.Toplevel(self.root)
+        tip.overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=f"{when}  {marker['title']}", bg="#17324d", fg="white",
+                 font=("Segoe UI", 10), padx=10, pady=6, relief="solid", bd=1).pack()
+        tip.geometry(f"+{event.x_root + 15}+{event.y_root + 12}")
+        self.topic_tooltip = tip
+        self.topic_hover_start = marker["start"]
+
+    def _hide_topic_tooltip(self):
+        if self.topic_tooltip:
+            self.topic_tooltip.destroy()
+            self.topic_tooltip = None
+        self.topic_hover_start = None
+
+    def _topic_click(self, event):
+        marker = self._topic_at(event.y)
+        if marker is None:
+            return
+        self._hide_topic_tooltip()
+        items = self._speech_items()
+        try:
+            first, end = topic_range(self.topic_markers, marker["start"], len(items))
+        except ValueError:
+            return
+        self.timeline_selection = (first, end)
+        self.timeline_anchor = None
+        self._draw_timeline()
+        self._show_selection_range(dragging=False)
+        self._begin_new_chat_cycle()
+        self._request_summary()
+
+    def _topic_tick(self):
+        if self.running:
+            self._request_topics()
+        self.root.after(20_000, self._topic_tick)
+
+    def _request_topics(self, force_global: bool = False):
+        if not self.transcript:
+            return
+        if self.topic_model_unavailable and self._openai_model() == "gpt-4o":
+            return
+        items = self._speech_items()
+        if not items:
+            return
+        if self.topic_pending:
+            self.topic_force_after_pending |= force_global
+            return
+        now = time.monotonic()
+        new_items = items[self.topic_last_count:]
+        new_words = sum(len(item["text"].split()) for item in new_items)
+        if not force_global:
+            if len(items) == self.topic_last_count:
+                return
+            if not self.topic_markers:
+                if len(items) < 2 or new_words < 30:
+                    return
+            elif now - self.topic_last_at < 60 or (new_words < 40 and now - self.topic_last_at < 120):
+                return
+        try:
+            key = load_openai_api_key().strip()
+        except Exception:
+            return
+        if not key:
+            return
+        global_pass = force_global or not self.topic_markers or now - self.topic_last_global_at >= 300
+        window_start = 0
+        if not global_pass:
+            cutoff = datetime.fromisoformat(items[-1]["when"]) - timedelta(minutes=5)
+            window_start = next((index for index, item in enumerate(items)
+                                 if datetime.fromisoformat(item["when"]) >= cutoff), 0)
+        lines = [self.transcript.format_line(item) for item in items]
+        previous = deepcopy(self.topic_markers)
+        session_id = self.transcript.id
+        model = self._openai_model()
+        self.topic_request_id += 1
+        request_id = self.topic_request_id
+        self.topic_pending = True
+        self.topic_last_count = len(items)
+        self.topic_last_at = now
+        if global_pass:
+            self.topic_last_global_at = now
+
+        def worker():
+            try:
+                topics = analyze_topics(key, lines, previous, window_start, model=model)
+                self.events.put(("topics_ok", (session_id, request_id, topics,
+                                                window_start, len(lines))))
+            except Exception as exc:
+                self.events.put(("topics_error", (session_id, request_id, str(exc))))
+        threading.Thread(target=worker, daemon=True, name="TT-topics").start()
+
+    def _finish_topic_request(self):
+        self.topic_pending = False
+        if self.topic_force_after_pending:
+            self.topic_force_after_pending = False
+            self._request_topics(force_global=True)
+
     def _request_summary(self):
         if not self.timeline_selection or not self.transcript:
             return
@@ -336,12 +497,13 @@ class TTApp:
             return
         lines = [self.transcript.format_line(item) for item in items]
         self.current_cycle_range = self.summary_range.cget("text")
+        model = self._openai_model()
         self.summary_request_id += 1
         request_id = self.summary_request_id
         self._set_summary("Summarizing the selected section…")
         def worker():
             try:
-                result = summarize(key, lines, first, last)
+                result = summarize(key, lines, first, last, model=model)
                 self.events.put(("summary_ok", (request_id, result)))
             except Exception as exc:
                 self.events.put(("summary_error", (request_id, str(exc))))
@@ -431,12 +593,13 @@ class TTApp:
         if not key:
             messagebox.showwarning("OpenAI", "Enter your OpenAI API key in Tools first.")
             return
+        model = self._openai_model()
         def worker():
             try:
                 # Use the same model and endpoint as a real summary, with a
                 # tiny sample. Authentication alone would not test model access.
-                summarize(key, ["[00:00:00] Person1: Hello."], 0, 0)
-                self.events.put(("openai_test_ok", None))
+                summarize(key, ["[00:00:00] Person1: Hello."], 0, 0, model=model)
+                self.events.put(("openai_test_ok", model))
             except Exception as exc:
                 self.events.put(("openai_test_error", str(exc)))
         threading.Thread(target=worker, daemon=True, name="TT-OpenAI-test").start()
@@ -444,7 +607,7 @@ class TTApp:
     def open_options(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("Options")
-        dialog.geometry("560x420")
+        dialog.geometry("560x490")
         dialog.transient(self.root)
         ttk.Label(dialog, text="Shortcut", padding=(12, 12, 12, 2)).pack(anchor="w")
         shortcut = tk.StringVar(value=self.settings.get("hotkey", "Ctrl+Alt+Q"))
@@ -464,6 +627,29 @@ class TTApp:
             save_settings(self.settings)
             self.action.config(text=("Stop" if self.running else "Start") + f" ({shortcut.get()})")
         ttk.Button(row, text="Apply", command=save_shortcut).pack(side="left", padx=8)
+
+        model_row = ttk.Frame(dialog, padding=(12, 10))
+        model_row.pack(fill="x")
+        ttk.Label(model_row, text="OpenAI model:").pack(side="left")
+        model_choice = tk.StringVar(value=self._openai_model())
+        model_box = ttk.Combobox(model_row, textvariable=model_choice,
+                                 values=OPENAI_MODELS, state="readonly", width=18)
+        model_box.pack(side="left", padx=8)
+        def save_model(_event=None):
+            model = model_choice.get()
+            if model not in OPENAI_MODELS or model == self._openai_model():
+                return
+            self.settings["openai_model"] = model
+            save_settings(self.settings)
+            self.topic_request_id += 1
+            self.topic_pending = False
+            self.topic_force_after_pending = False
+            self.topic_model_unavailable = False
+            if self.transcript and self._speech_items():
+                self._request_topics(force_global=True)
+        model_box.bind("<<ComboboxSelected>>", save_model)
+        ttk.Label(dialog, text="GPT-4o is scheduled for API retirement on 14 Jan 2027.",
+                  padding=(12, 0), foreground="#476477").pack(anchor="w")
 
         ttk.Label(dialog, text="Speakers in current session", padding=(12, 18, 12, 2)).pack(anchor="w")
         speakers = tk.Listbox(dialog, height=10)
@@ -530,6 +716,15 @@ class TTApp:
         self.last_live = ""
         self.timeline_selection = None
         self.timeline_anchor = None
+        self._hide_topic_tooltip()
+        self.topic_markers = []
+        self.topic_request_id += 1
+        self.topic_pending = False
+        self.topic_force_after_pending = False
+        self.topic_model_unavailable = False
+        self.topic_last_count = 0
+        self.topic_last_at = 0.0
+        self.topic_last_global_at = 0.0
         self.summary_request_id += 1
         self.chat_request_id += 1
         self.current_summary = ""
@@ -627,6 +822,7 @@ class TTApp:
                     self.partials.clear()
                     self._show_live()
                     self._render()
+                    self._request_topics(force_global=True)
                 elif kind == "error":
                     self.had_error = True
                     self.state_label.config(text=f"Error: {data}")
@@ -635,7 +831,7 @@ class TTApp:
                 elif kind == "test_error":
                     messagebox.showerror("AssemblyAI", f"Connection failed: {data}")
                 elif kind == "openai_test_ok":
-                    messagebox.showinfo("OpenAI", "Connection successful. Summaries are available.")
+                    messagebox.showinfo("OpenAI", f"Connection successful with {data}.")
                 elif kind == "openai_test_error":
                     messagebox.showerror("OpenAI", f"Connection failed: {data}")
                 elif kind == "summary_ok":
@@ -665,6 +861,28 @@ class TTApp:
                         self.chat_text.config(state="normal")
                         self.chat_text.insert("end", f"\nCould not answer ‘{question}’: {error}")
                         self.chat_text.config(state="disabled")
+                elif kind == "topics_ok":
+                    session_id, request_id, topics, window_start, line_count = data
+                    if self.transcript and session_id == self.transcript.id and request_id == self.topic_request_id:
+                        try:
+                            self.topic_markers = merge_topics(self.topic_markers, topics,
+                                                              window_start, line_count)
+                            self._hide_topic_tooltip()
+                            self._draw_timeline()
+                        except ValueError:
+                            self.topic_last_count = 0
+                            self.topic_last_global_at = 0.0
+                        finally:
+                            self._finish_topic_request()
+                elif kind == "topics_error":
+                    session_id, request_id, error = data
+                    if self.transcript and session_id == self.transcript.id and request_id == self.topic_request_id:
+                        self.topic_last_count = 0
+                        self.topic_last_global_at = 0.0
+                        if error.startswith("GPT-4o is unavailable"):
+                            self.topic_model_unavailable = True
+                            messagebox.showwarning("OpenAI model", error)
+                        self._finish_topic_request()
         except queue.Empty:
             pass
         self.root.after(80, self._drain)

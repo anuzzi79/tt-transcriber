@@ -39,17 +39,17 @@ def icon_png(size: int, glow: float, recording: bool) -> bytes:
             dx = (x - center) / scale
             dy = (y - center) / scale
             radius = math.hypot(dx, dy)
-            if radius > 15.4:
+            if radius > 15.6:
                 rgba = (0, 0, 0, 0)
-            elif radius > 10.3:
-                strength = max(0.0, 1.0 - (radius - 10.3) / 5.1)
+            elif radius > 12.7:
+                strength = max(0.0, 1.0 - (radius - 12.7) / 2.9)
                 if recording:
                     rgba = (255, 35, 48, round(225 * glow * strength))
                 else:
                     rgba = (43, 145, 193, round(150 * strength))
             else:
                 rgba = (20, 39, 57, 255)
-                if 9.4 < radius <= 10.3:
+                if 11.3 < radius <= 12.7:
                     rgba = ((round(85 + 170 * glow), round(12 + 42 * glow),
                              round(20 + 45 * glow), 255)
                             if recording else (54, 170, 216, 255))

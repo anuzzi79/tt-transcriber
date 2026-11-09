@@ -15,6 +15,7 @@ from tt.storage import (load_api_key, load_openai_api_key, load_settings, save_a
                         save_openai_api_key, save_settings, transcript_dir, Transcript)
 from tt.summary import (DEFAULT_OPENAI_MODEL, OPENAI_MODELS, analyze_topics,
                         answer_question, line_at, merge_topics, summarize, topic_range)
+from tt.taskbar import TaskbarPulse
 from tt.voices import VoiceProfiles
 
 
@@ -58,6 +59,7 @@ class TTApp:
         self.previous_dialogues: list[dict] = []
         self.chat_pending_question = ""
         self._build()
+        self.taskbar_pulse = TaskbarPulse(self.root)
         self._install_hotkey()
         self.root.after(80, self._drain)
         self.root.after(20_000, self._topic_tick)
@@ -711,6 +713,7 @@ class TTApp:
             return
         self.engine = MeetingEngine(key, self.transcript, lambda kind, data: self.events.put((kind, data)))
         self.running = True
+        self.taskbar_pulse.set_active(True)
         self.had_error = False
         self.partials.clear()
         self.last_live = ""
@@ -751,6 +754,7 @@ class TTApp:
         if not self.running:
             return
         self.running = False
+        self.taskbar_pulse.set_active(False)
         self.state_label.config(text="Stopping and saving…")
         self.action.config(state="disabled")
         engine = self.engine
@@ -763,6 +767,7 @@ class TTApp:
             self.stop()
             self.root.after(100, self._close_when_stopped)
         else:
+            self.taskbar_pulse.close()
             self.hotkey.stop()
             self.root.destroy()
 
@@ -770,6 +775,7 @@ class TTApp:
         if self.engine and self.engine.thread and self.engine.thread.is_alive():
             self.root.after(100, self._close_when_stopped)
         else:
+            self.taskbar_pulse.close()
             self.hotkey.stop()
             self.root.destroy()
 
@@ -817,6 +823,7 @@ class TTApp:
                     self._render()
                 elif kind == "stopped":
                     self.running = False
+                    self.taskbar_pulse.set_active(False)
                     self.state_label.config(text="Stopped after error; transcript saved" if self.had_error else "Saved")
                     self.action.config(state="normal", text=f"Start ({self.settings.get('hotkey', 'Ctrl+Alt+Q')})")
                     self.partials.clear()
